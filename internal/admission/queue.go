@@ -34,14 +34,17 @@ func (q *Queue) Add(chamberID string, planID uuid.UUID, vessels []model.Vessel) 
 	return nil
 }
 
+// Peek returns the first vessel still awaiting release. Entries already
+// released into the chamber no longer block later convoys.
 func (q *Queue) Peek(chamberID string) (QueueEntry, bool) {
 	q.mu.RLock()
-	entries := q.entries[chamberID]
-	q.mu.RUnlock()
-	if len(entries) == 0 {
-		return QueueEntry{}, false
+	defer q.mu.RUnlock()
+	for _, entry := range q.entries[chamberID] {
+		if !entry.Released {
+			return entry, true
+		}
 	}
-	return entries[0], true
+	return QueueEntry{}, false
 }
 
 func (q *Queue) MarkReleased(chamberID string, vesselID uuid.UUID) bool {
@@ -54,6 +57,18 @@ func (q *Queue) MarkReleased(chamberID string, vesselID uuid.UUID) bool {
 		}
 	}
 	return false
+}
+
+// UnmarkReleased reverses a release whose commit could not be completed.
+func (q *Queue) UnmarkReleased(chamberID string, vesselID uuid.UUID) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for index := range q.entries[chamberID] {
+		if q.entries[chamberID][index].Vessel.ID == vesselID {
+			q.entries[chamberID][index].Released = false
+			return
+		}
+	}
 }
 
 func (q *Queue) RemovePlan(chamberID string, planID uuid.UUID) []QueueEntry {

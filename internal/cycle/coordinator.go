@@ -40,6 +40,7 @@ func (c *Coordinator) Start(ctx context.Context, plan model.ConvoyPlan) (model.T
 		c.mu.Unlock()
 		return model.TransitCycle{}, errors.New("chamber already has an active transit")
 	}
+	previous, hadPrevious := c.current[plan.ChamberID]
 	c.generations[plan.ChamberID]++
 	cycleValue, err := model.NewTransitCycle(plan.ChamberID, plan.ID, plan.Direction, c.generations[plan.ChamberID], c.now())
 	if err == nil {
@@ -50,9 +51,53 @@ func (c *Coordinator) Start(ctx context.Context, plan model.ConvoyPlan) (model.T
 		return model.TransitCycle{}, err
 	}
 	if _, err := c.recorder.Record(ctx, plan.ChamberID, model.EventCycleCreated, cycleValue.ID, cycleValue.Generation, cycleValue); err != nil {
+		c.rollback(plan.ChamberID, cycleValue.ID, previous, hadPrevious)
 		return model.TransitCycle{}, err
 	}
 	return cycleValue, nil
+}
+
+// rollback removes a cycle whose creation event could not be recorded, but
+// only while it is still the exact generation installed by Start.
+func (c *Coordinator) rollback(chamberID string, cycleID uuid.UUID, previous model.TransitCycle, hadPrevious bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if current, ok := c.current[chamberID]; ok && current.ID == cycleID {
+		if hadPrevious {
+			c.current[chamberID] = previous
+		} else {
+			delete(c.current, chamberID)
+		}
+	}
+}
+
+// HasActive reports whether a non-terminal transit currently owns the chamber.
+func (c *Coordinator) HasActive(chamberID string) bool {
+	c.mu.RLock()
+	active, ok := c.current[chamberID]
+	c.mu.RUnlock()
+	return ok && !active.Stage.Terminal()
+}
+
+// Abort drives a freshly created cycle to a durable terminal stage when the
+// rest of the submission cannot commit. The in-memory cycle is always
+// terminalized so it can never block or be admitted afterwards; a journal
+// failure is returned without undoing that guarantee.
+func (c *Coordinator) Abort(ctx context.Context, cycleValue model.TransitCycle, reason string) error {
+	c.mu.Lock()
+	current, ok := c.current[cycleValue.ChamberID]
+	if !ok || current.ID != cycleValue.ID || current.Stage.Terminal() {
+		c.mu.Unlock()
+		return nil
+	}
+	if err := current.Advance(model.StageCancelled, reason, c.now()); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	c.current[cycleValue.ChamberID] = current
+	c.mu.Unlock()
+	_, err := c.recorder.Record(ctx, cycleValue.ChamberID, model.EventCycleAdvanced, current.ID, current.Generation, current)
+	return err
 }
 
 func (c *Coordinator) Current(chamberID string) (model.TransitCycle, bool) {

@@ -67,8 +67,6 @@ func NewRuntime(ctx context.Context, dataDirectory string) (*Runtime, error) {
 	leaseRegistry := lease.NewRegistry()
 	leaseService := lease.NewService(leaseRegistry, admissionController, recorder, now)
 	leaseSweeper := lease.NewSweeper(leaseRegistry, now)
-	planner := schedule.NewPlanner(admissionService, recorder, now)
-	scheduleService := schedule.NewService(planner, signalPublisher)
 	ramp := hydraulics.NewRamp(25*time.Millisecond, now)
 	hydraulicsController := hydraulics.NewController(gateCommands, recorder, ramp, now)
 	barrier := safety.NewBarrier()
@@ -88,14 +86,40 @@ func NewRuntime(ctx context.Context, dataDirectory string) (*Runtime, error) {
 		levelByChamber, emergencyActive,
 	)
 	cycleCoordinator := cycle.NewCoordinator(gateController, hydraulicsController, recorder, now)
-	cycleService := cycle.NewService(cycleCoordinator, admissionService)
+	cycleService := cycle.NewService(cycleCoordinator)
 	safetyCoordinator = safety.NewCoordinator(gateCommands, barrier, recorder, now)
 	safetyService := safety.NewService(safetyCoordinator, cycleCoordinator)
 	signalService.BindTransitLookup(cycleCoordinator)
+	planner := schedule.NewPlanner(admissionService, cycleCoordinator, recorder, now)
+	scheduleService := schedule.NewService(planner, signalPublisher)
 	replayer := journal.NewReplayer(store)
 	recovery := cycle.NewRecovery(replayer, cycleCoordinator)
 	if _, err := recovery.RestoreAll(ctx); err != nil {
 		return nil, err
+	}
+	// Re-link plans whose cycles survived the restart from their journal events.
+	for _, chamberID := range chambers {
+		cycleValue, ok := cycleCoordinator.Current(chamberID)
+		if !ok || cycleValue.Stage.Terminal() {
+			continue
+		}
+		events, err := store.Events(ctx, chamberID, 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, event := range events {
+			if event.Type != model.EventPlanCreated {
+				continue
+			}
+			var restored model.ConvoyPlan
+			if err := event.Decode(&restored); err != nil {
+				return nil, err
+			}
+			if restored.ID == cycleValue.PlanID {
+				planner.Restore(restored)
+				break
+			}
+		}
 	}
 	health := monitor.NewHealthRegistry()
 	for _, chamberID := range chambers {
